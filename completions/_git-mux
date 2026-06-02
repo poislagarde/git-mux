@@ -1,0 +1,20 @@
+#compdef git-mux
+
+# git-mux runs a git command across many repos serially with SSH multiplexing.
+# Complete its own flags first, then fall through to git's command completion
+# (same delegation pattern zsh uses for `_git-for-each-repo`).
+_git-mux() {
+  _arguments -S \
+    '(-d --depth)'{-d,--depth}'[directory levels to search]:depth' \
+    '(-C --dir)'{-C,--dir}'[base directory to scan]:dir:_files -/' \
+    '(-r --retries)'{-r,--retries}'[retries on transient errors]:retries' \
+    '(-b --backoff)'{-b,--backoff}'[backoff seconds per retry]:backoff' \
+    '--no-mux[disable SSH connection multiplexing]' \
+    '(-q --quiet)'{-q,--quiet}'[one status line per repo instead of full output]' \
+    '(-n --dry-run)'{-n,--dry-run}'[list repos and plan, run nothing]' \
+    '(-h --help)'{-h,--help}'[show help]' \
+    ':git command:_git_commands' \
+    '*:: := _git'
+}
+
+_git-mux "$@"

@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+#
+# git-mux — run a git command across many repos, SERIALLY, with per-host SSH
+#           connection multiplexing so you don't trip a server's connection-rate
+#           throttle (the thing that makes many parallel `git pull`s time out).
+#
+# All operations to the same SSH server reuse ONE persistent connection
+# (OpenSSH ControlMaster), so the server's per-IP connection counter barely
+# moves. Works for any SSH git host — GitHub, GitLab, Bitbucket, self-hosted —
+# and for https/local remotes too (multiplexing simply doesn't apply to those).
+#
+# By default it prints each repo's command output under a clear per-repo header
+# (like `git multi`); pass -q for a one-line status per repo instead.
+#
+# Usage:
+#   git mux [options] <git command and args...>
+#
+#   git mux pull                        # `git pull` in every repo under the cwd
+#   git mux pull --rebase --autostash
+#   git mux fetch --all --prune
+#   git mux status -sb
+#   git mux -d 2 pull                   # search two directory levels deep
+#   git mux -n pull                     # dry run: list repos + plan, run nothing
+#
+# Options:
+#   -d, --depth N     directory levels to search for repos (default 1, like git multi)
+#   -C, --dir DIR     base directory to scan (default: current directory)
+#   -r, --retries N   retries per repo on transient network/throttle errors (default 3)
+#   -b, --backoff "S..."  space-separated backoff seconds per retry (default "5 15 45")
+#       --no-mux      disable SSH connection multiplexing
+#   -q, --quiet       print one concise status line per repo instead of full
+#                     output (failures still show output; retries go to stderr)
+#   -n, --dry-run     show the discovered repos, hosts and plan, then exit
+#   -h, --help        show this help
+#
+# Exit status: number of repos that failed, capped at 255 (0 = all succeeded), like xargs.
+
+set -o pipefail   # note: deliberately NOT `set -u` — macOS bash 3.2 errors on empty "${arr[@]}"
+
+prog=git-mux
+
+usage() { sed -n '2,/^# Exit status/p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; }
+die_usage() { echo "$prog: $1" >&2; echo "try: $prog --help" >&2; exit 2; }
+is_uint() {
+  case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac
+}
+is_pos_uint() {
+  case "$1" in ''|*[!0-9]*) return 1;; *[1-9]*) return 0;; *) return 1;; esac
+}
+normalize_uint() {
+  local n="$1"
+  while [ "${n#0}" != "$n" ]; do n="${n#0}"; done
+  [ -n "$n" ] || n=0
+  printf '%s\n' "$n"
+}
+is_seconds() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+validate_options() {
+  local b saw=0
+  is_pos_uint "$DEPTH" || die_usage "invalid depth: $DEPTH"
+  is_uint "$RETRIES" || die_usage "invalid retries: $RETRIES"
+  for b in $BACKOFF; do
+    saw=1
+    is_seconds "$b" || die_usage "invalid backoff value: $b"
+  done
+  [ "$saw" = 1 ] || die_usage "backoff must include at least one value"
+  DEPTH="$(normalize_uint "$DEPTH")"
+  RETRIES="$(normalize_uint "$RETRIES")"
+}
+
+# ---- option parsing -------------------------------------------------------
+DEPTH=1; BASE="."; RETRIES=3; BACKOFF="5 15 45"; MUX=1; QUIET=0; DRY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d|--depth)   [ $# -ge 2 ] || die_usage "$1 requires an argument"; DEPTH="$2"; shift 2;;
+    -C|--dir)     [ $# -ge 2 ] || die_usage "$1 requires an argument"; BASE="$2"; shift 2;;
+    -r|--retries) [ $# -ge 2 ] || die_usage "$1 requires an argument"; RETRIES="$2"; shift 2;;
+    -b|--backoff) [ $# -ge 2 ] || die_usage "$1 requires an argument"; BACKOFF="$2"; shift 2;;
+    --no-mux)     MUX=0; shift;;
+    -q|--quiet)   QUIET=1; shift;;
+    -n|--dry-run) DRY=1; shift;;
+    -h|--help)    usage; exit 0;;
+    --)           shift; break;;
+    --*|-*)       die_usage "unknown option: $1";;
+    *)            break;;   # first non-option token starts the git command
+  esac
+done
+validate_options
+
+GIT_ARGS=("$@")
+if [ "${#GIT_ARGS[@]}" -eq 0 ]; then
+  die_usage "no git command given"
+fi
+
+if [ ! -d "$BASE" ]; then echo "$prog: not a directory: $BASE" >&2; exit 2; fi
+
+USER_GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-}"
+USER_GIT_SSH="${GIT_SSH:-}"
+
+# colors only on a tty
+if [ -t 1 ]; then
+  C_OK=$'\033[32m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
+  # We capture each command's output, which makes git drop color (its `auto`
+  # default only colors a terminal). Force color so `git mux status` looks like
+  # `git status` — gated on our own stdout being a tty, mirroring git's logic.
+  GIT_COLOR=(-c color.ui=always)
+else
+  C_OK=""; C_ERR=""; C_DIM=""; C_RST=""
+  GIT_COLOR=()
+fi
+
+# ---- repo discovery (mirrors git multi: depth 1 = immediate children) -----
+repos=(); repo_keys=(); scanned_dir_keys=()
+canonical_dir() {
+  (cd "$1" 2>/dev/null && pwd -P)
+}
+seen_key() {  # $1=arrayname-by-ref via eval, $2=value
+  local arr="$1" val="$2" e
+  eval "for e in \"\${$arr[@]}\"; do [ \"\$e\" = \"\$val\" ] && return 0; done" 2>/dev/null
+  return 1
+}
+add_scanned_dir() {
+  local key
+  key="$(canonical_dir "$1")" || return 1
+  seen_key scanned_dir_keys "$key" && return 1
+  scanned_dir_keys+=("$key")
+  return 0
+}
+add_repo() {
+  local repo="$1" top key
+  top="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || top="$repo"
+  key="$(canonical_dir "$top")" || return 1
+  seen_key repo_keys "$key" && return 0
+  repo_keys+=("$key")
+  repos+=("$repo")
+}
+scan() {  # $1=dir  $2=remaining-depth
+  local dir="$1" depth="$2" child
+  add_scanned_dir "$dir" || return 0
+  for child in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    [ -d "$child" ] || continue
+    if [ -e "$child/.git" ]; then
+      add_repo "$child"                       # a repo: record it once, don't descend
+    elif [ "$depth" -gt 1 ]; then
+      scan "$child" $((depth - 1))            # not a repo: recurse if allowed
+    fi
+  done
+}
+scan "$BASE" "$DEPTH"
+
+if [ "${#repos[@]}" -eq 0 ]; then
+  echo "$prog: no git repos found under '$BASE' (depth $DEPTH)" >&2; exit 2
+fi
+
+# ---- parse the SSH endpoint (user@host[, port]) from a remote URL ---------
+# Prints "ssh-target" on line 1 and port (or empty) on line 2; nothing if not SSH.
+ssh_endpoint() {
+  local url="$1" rest user_prefix hostport host port after
+  case "$url" in
+    ssh://*)
+      rest="${url#ssh://}"; rest="${rest%%/*}"        # [user@]host[:port]
+      user_prefix=""; hostport="$rest"; host=""; port=""
+      case "$hostport" in
+        *@*) user_prefix="${hostport%@*}@"; hostport="${hostport#*@}" ;;
+      esac
+      case "$hostport" in
+        \[*\]*)
+          host="${hostport#\[}"; host="${host%%\]*}"
+          after="${hostport#\[$host\]}"
+          case "$after" in
+            "") ;;
+            :*) port="${after#:}" ;;
+            *) return 0 ;;
+          esac ;;
+        *:*:*)
+          host="$hostport" ;;                         # unbracketed IPv6, no port
+        *:*)
+          host="${hostport%:*}"; port="${hostport##*:}" ;;
+        *)
+          host="$hostport" ;;
+      esac
+      [ -n "$host" ] || return 0
+      [ -z "$port" ] || is_uint "$port" || return 0
+      printf '%s%s\n%s\n' "$user_prefix" "$host" "$port" ;;
+    *://*) : ;;                                        # https/git/etc: not SSH
+    /*|.*|file:*) : ;;                                 # local path
+    *:*)                                               # scp-like  user@host:path
+      hostport="${url%%:*}"
+      case "$hostport" in
+        */*) : ;;                                      # slash before colon: local path
+        *) printf '%s\n\n' "$hostport" ;;
+      esac ;;
+  esac
+}
+
+quote_args() {
+  local arg quoted out=""
+  for arg in "$@"; do
+    printf -v quoted '%q' "$arg"
+    out="${out:+$out }$quoted"
+  done
+  printf '%s\n' "$out"
+}
+repo_core_ssh_command() {
+  git -C "$1" config --get core.sshCommand 2>/dev/null
+}
+base_ssh_command() {
+  local repo="${1:-}" core_cmd
+  if [ -n "$USER_GIT_SSH_COMMAND" ]; then
+    printf '%s\n' "$USER_GIT_SSH_COMMAND"
+  elif [ -n "$repo" ] && core_cmd="$(repo_core_ssh_command "$repo")" && [ -n "$core_cmd" ]; then
+    printf '%s\n' "$core_cmd"
+  elif [ -n "$USER_GIT_SSH" ]; then
+    quote_args "$USER_GIT_SSH"
+  else
+    printf '%s\n' ssh
+  fi
+}
+base_ssh_command_source() {
+  local repo="${1:-}" core_cmd
+  if [ -n "$USER_GIT_SSH_COMMAND" ]; then
+    printf '%s\n' "GIT_SSH_COMMAND"
+  elif [ -n "$repo" ] && core_cmd="$(repo_core_ssh_command "$repo")" && [ -n "$core_cmd" ]; then
+    printf '%s\n' "core.sshCommand in $repo"
+  elif [ -n "$USER_GIT_SSH" ]; then
+    printf '%s\n' "GIT_SSH"
+  else
+    printf '%s\n' "ssh"
+  fi
+}
+
+ssh_command_has_mux_controls() {
+  local cmd="$1" normalized scan_cmd mux_opt
+  [ -n "$cmd" ] || return 1
+  normalized="${cmd//\\/}"
+  normalized="${normalized//\"/}"
+  normalized="${normalized//\'/}"
+  for scan_cmd in "$cmd" "$normalized"; do
+    grep -Eq '(^|[[:space:]])-(S[^[:space:]]*|M[^[:space:]]*|[^[:space:]o-][^[:space:]]*[SM][^[:space:]]*)($|[[:space:]])' <<<"$scan_cmd" && return 0
+    for mux_opt in \
+      '[Cc][Oo][Nn][Tt][Rr][Oo][Ll][Mm][Aa][Ss][Tt][Ee][Rr]' \
+      '[Cc][Oo][Nn][Tt][Rr][Oo][Ll][Pp][Aa][Tt][Hh]' \
+      '[Cc][Oo][Nn][Tt][Rr][Oo][Ll][Pp][Ee][Rr][Ss][Ii][Ss][Tt]'
+    do
+      grep -Eiq "(^|[[:space:]])-o[[:space:]]*$mux_opt($|[[:space:]=])" <<<"$scan_cmd" && return 0
+    done
+  done
+  return 1
+}
+run_ssh_command() {
+  local cmd="$1" base_cmd="$2"; shift 2
+  GIT_MUX_BASE_SSH_COMMAND="$base_cmd" /bin/sh -c "$cmd \"\$@\"" "$prog-ssh" "$@"
+}
+
+write_ssh_mux_wrapper() {
+  local wrapper="$1"
+  cat > "$wrapper" <<'EOF' || return 1
+#!/usr/bin/env bash
+set -o pipefail
+
+ssh_mux_destination_key() {
+  local skip=0 arg
+  for arg in "$@"; do
+    if [ "$skip" = 1 ]; then
+      skip=0
+      continue
+    fi
+    case "$arg" in
+      -[bcDEeFIiJLlmOopQRSWw])
+        skip=1 ;;
+      -[bcDEeFIiJLlmOopQRSWw]?*)
+        ;;
+      -*)
+        ;;
+      *)
+        printf '%s\n' "$arg"
+        return 0 ;;
+    esac
+  done
+  return 1
+}
+
+dest="$(ssh_mux_destination_key "$@")" || dest=unknown
+ORIGINAL_ARGS=("$@")
+set -- $(printf '%s' "$dest" | cksum)
+suffix="$1-$2"
+
+SSHOPTS=(
+  -o ControlMaster=auto
+  -o "ControlPath=${GIT_MUX_ACTIVE_SOCKDIR:?}/%C-$suffix"
+  -o ControlPersist=30
+  -o ConnectTimeout=25
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=4
+  -o BatchMode=yes
+)
+
+exec /bin/sh -c "$GIT_MUX_BASE_SSH_COMMAND \"\$@\"" git-mux-ssh "${SSHOPTS[@]}" "${ORIGINAL_ARGS[@]}"
+EOF
+  chmod 700 "$wrapper"
+}
+
+# unique SSH endpoints (for clean teardown) + unique hosts (for the header)
+endpoint_targets=(); endpoint_ports=(); endpoint_base_commands=(); hosts=(); repo_has_ssh=()
+add_uniq() {  # $1=arrayname-by-ref via eval, $2=value
+  local arr="$1" val="$2"
+  [ -n "$val" ] || return 0
+  seen_key "$arr" "$val" && return 0
+  eval "$arr+=(\"\$val\")"
+}
+add_endpoint() {
+  local ep="$1" pt="$2" base_cmd="$3" idx
+  for idx in "${!endpoint_targets[@]}"; do
+    [ "${endpoint_targets[$idx]}" = "$ep" ] &&
+      [ "${endpoint_ports[$idx]}" = "$pt" ] &&
+      [ "${endpoint_base_commands[$idx]}" = "$base_cmd" ] &&
+      return 0
+  done
+  endpoint_targets+=("$ep")
+  endpoint_ports+=("$pt")
+  endpoint_base_commands+=("$base_cmd")
+}
+for r in "${repos[@]}"; do
+  has_ssh=0
+  repo_base_ssh_command="$(base_ssh_command "$r")"
+  while IFS= read -r url; do
+    [ -n "$url" ] || continue
+    ep_out="$(ssh_endpoint "$url")"
+    ep="$(printf '%s\n' "$ep_out" | sed -n '1p')"
+    pt="$(printf '%s\n' "$ep_out" | sed -n '2p')"
+    if [ -n "$ep" ]; then
+      has_ssh=1
+      add_endpoint "$ep" "$pt" "$repo_base_ssh_command"
+      add_uniq hosts "${ep#*@}"
+    fi
+  done < <(git -C "$r" remote -v 2>/dev/null | awk '{print $2}' | sort -u)
+  repo_has_ssh+=("$has_ssh")
+done
+
+# ---- plan / dry-run -------------------------------------------------------
+hoststr="$(printf '%s, ' "${hosts[@]}")"; hoststr="${hoststr%, }"
+[ -n "$hoststr" ] || hoststr="(no SSH remotes)"
+muxstr="off"
+if [ "$MUX" = 1 ] && [ "${#endpoint_targets[@]}" -gt 0 ]; then
+  muxstr="on"
+  for idx in "${!repos[@]}"; do
+    [ "${repo_has_ssh[$idx]}" = 1 ] || continue
+    repo_base_ssh_command="$(base_ssh_command "${repos[$idx]}")"
+    if ssh_command_has_mux_controls "$repo_base_ssh_command"; then
+      ssh_command_source="$(base_ssh_command_source "${repos[$idx]}")"
+      echo "$prog: $ssh_command_source sets SSH multiplexing controls that conflict with git-mux" >&2
+      echo "$prog: remove ControlMaster/ControlPath/ControlPersist/-S/-M/-MM from $ssh_command_source or pass --no-mux" >&2
+      exit 2
+    fi
+  done
+fi
+if [ "$QUIET" = 0 ] || [ "$DRY" = 1 ]; then
+  echo "${C_DIM}$prog: git ${GIT_ARGS[*]}${C_RST}"
+  echo "${C_DIM}  ${#repos[@]} repos · ${#hosts[@]} SSH host(s): $hoststr · multiplexing: $muxstr · serial · retries: $RETRIES${C_RST}"
+fi
+if [ "$DRY" = 1 ]; then
+  for r in "${repos[@]}"; do echo "  $r"; done
+  exit 0
+fi
+
+# ---- set up SSH connection multiplexing -----------------------------------
+SOCKDIR=""; GIT_MUX_EFFECTIVE_SSH_COMMAND=""; SSH_MUX_WRAPPER=""
+if [ "$MUX" = 1 ] && [ "${#endpoint_targets[@]}" -gt 0 ]; then
+  # Control sockets need a SHORT base path: an AF_UNIX socket path is capped at
+  # ~104 chars and ssh's %C token is 40, so a long $TMPDIR (e.g. macOS's
+  # /var/folders/...) won't fit. Default to /tmp; override with GIT_MUX_SOCKDIR.
+  SOCKBASE="${GIT_MUX_SOCKDIR:-/tmp}"
+  if [ ! -d "$SOCKBASE" ]; then
+    echo "$prog: SSH mux socket base is not a directory: $SOCKBASE" >&2
+    exit 2
+  fi
+  if ! SOCKDIR="$(mktemp -d "$SOCKBASE/$prog.XXXXXXXXXX")"; then
+    echo "$prog: cannot create SSH mux socket directory under: $SOCKBASE" >&2
+    exit 2
+  fi
+  if ! chmod 700 "$SOCKDIR"; then
+    echo "$prog: cannot create SSH mux socket directory under: $SOCKBASE" >&2
+    exit 2
+  fi
+  SSH_MUX_WRAPPER="$SOCKDIR/ssh-wrapper"
+  if ! write_ssh_mux_wrapper "$SSH_MUX_WRAPPER"; then
+    echo "$prog: cannot create SSH mux wrapper under: $SOCKDIR" >&2
+    exit 2
+  fi
+  export GIT_MUX_ACTIVE_SOCKDIR="$SOCKDIR"
+  GIT_MUX_EFFECTIVE_SSH_COMMAND="$(quote_args "$SSH_MUX_WRAPPER")"
+  export GIT_SSH_COMMAND="$GIT_MUX_EFFECTIVE_SSH_COMMAND"
+fi
+
+cleanup() {
+  local idx ep pt base_cmd
+  if [ -n "$SOCKDIR" ]; then
+    for idx in "${!endpoint_targets[@]}"; do
+      ep="${endpoint_targets[$idx]}"
+      pt="${endpoint_ports[$idx]}"
+      base_cmd="${endpoint_base_commands[$idx]}"
+      if [ -n "$pt" ]; then
+        run_ssh_command "$GIT_MUX_EFFECTIVE_SSH_COMMAND" "$base_cmd" -O exit -p "$pt" "$ep" >/dev/null 2>&1
+      else
+        run_ssh_command "$GIT_MUX_EFFECTIVE_SSH_COMMAND" "$base_cmd" -O exit "$ep" >/dev/null 2>&1
+      fi
+    done
+    rm -rf "$SOCKDIR"
+    SOCKDIR=""
+  fi
+}
+terminate() {
+  local status="$1"
+  cleanup
+  trap - EXIT INT TERM
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'terminate 130' INT
+trap 'terminate 143' TERM
+
+# ---- transient-error detection (generic, host-agnostic) -------------------
+NET_ERR_RE="banner exchange|timed out|timeout|connection (closed|reset|refused|timed out)|kex_exchange[a-z_]*|broken pipe|temporary failure|operation timed out|ssh: connect|failed to connect|couldn't connect|recv failure"
+is_net_err() {
+  grep -qiE "$NET_ERR_RE" <<<"$1"
+}
+nth_backoff() {  # $1 = 1-based retry number -> seconds (last value repeats)
+  local n="$1" i=1 b last=30
+  for b in $BACKOFF; do last="$b"; [ "$i" -eq "$n" ] && { echo "$b"; return; }; i=$((i+1)); done
+  echo "$last"
+}
+
+# ---- run serially ---------------------------------------------------------
+ok=0; fail=0; failed_repos=()
+i=0; total=${#repos[@]}
+for r in "${repos[@]}"; do
+  i=$((i + 1)); name="${r#./}"
+  repo_base_ssh_command="$(base_ssh_command "$r")"
+  attempt=0
+  while :; do
+    if [ -n "$GIT_MUX_EFFECTIVE_SSH_COMMAND" ]; then
+      out="$(GIT_MUX_BASE_SSH_COMMAND="$repo_base_ssh_command" git "${GIT_COLOR[@]}" -C "$r" "${GIT_ARGS[@]}" 2>&1)"; rc=$?
+    else
+      out="$(git "${GIT_COLOR[@]}" -C "$r" "${GIT_ARGS[@]}" 2>&1)"; rc=$?
+    fi
+    if [ "$rc" -eq 0 ]; then
+      ok=$((ok + 1))
+      # always surface recovery feedback (on stderr) when retries were needed
+      [ "$attempt" -gt 0 ] && printf '%s[%d/%d] %s: recovered after %d retr%s%s\n' \
+        "$C_OK" "$i" "$total" "$name" "$attempt" "$([ "$attempt" -eq 1 ] && echo y || echo ies)" "$C_RST" >&2
+      if [ "$QUIET" = 1 ]; then
+        printf '%s[%d/%d] OK%s   %s\n' "$C_OK" "$i" "$total" "$C_RST" "$name"
+      else
+        # default: per-repo header + the command's output (git multi style)
+        printf '%s━━━ [%d/%d] %s ━━━%s\n' "$C_OK" "$i" "$total" "$name" "$C_RST"
+        [ -n "$out" ] && printf '%s\n' "$out"
+        echo
+      fi
+      break
+    fi
+    if is_net_err "$out" && [ "$attempt" -lt "$RETRIES" ]; then
+      attempt=$((attempt + 1)); w="$(nth_backoff "$attempt")"
+      # brief reason so the feedback says *why* we're waiting; always shown (stderr)
+      reason="$(grep -m 1 -ioE "$NET_ERR_RE" <<<"$out")"
+      printf '%s[%d/%d] %s: %s — retry %d/%d in %ss…%s\n' \
+        "$C_DIM" "$i" "$total" "$name" "${reason:-transient network error}" "$attempt" "$RETRIES" "$w" "$C_RST" >&2
+      sleep "$w"; continue
+    fi
+    fail=$((fail + 1)); failed_repos+=("$name")
+    if [ "$QUIET" = 1 ]; then
+      printf '%s[%d/%d] FAIL%s %s\n' "$C_ERR" "$i" "$total" "$C_RST" "$name"
+      printf '%s\n' "$out" | tail -4 | sed 's/^/    /'
+    else
+      printf '%s━━━ [%d/%d] %s — FAILED ━━━%s\n' "$C_ERR" "$i" "$total" "$name" "$C_RST"
+      [ -n "$out" ] && printf '%s\n' "$out"
+      echo
+    fi
+    break
+  done
+done
+
+# ---- summary --------------------------------------------------------------
+echo
+echo "${C_DIM}──────── $prog summary ────────${C_RST}"
+printf 'ok: %s   failed: %s   total: %s\n' "$ok" "$fail" "$total"
+if [ "$fail" -gt 0 ]; then
+  echo "${C_ERR}failed repos:${C_RST}"
+  for f in "${failed_repos[@]}"; do echo "  - $f"; done
+fi
+
+if [ "$fail" -gt 255 ]; then
+  exit 255
+fi
+exit "$fail"
