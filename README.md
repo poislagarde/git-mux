@@ -114,11 +114,19 @@ identities do not reuse one another's master connection and long hostnames do no
 path limits. Repos using the same SSH alias still share one connection. `ServerAlive*` makes a
 silently-throttling server drop the connection instead of hanging, and `BatchMode` keeps it from
 blocking on a prompt. Host-key checking is left to your SSH config. The master connections are closed
-on exit. If you already set `GIT_SSH_COMMAND`, `git-mux` appends its OpenSSH options to your command
-instead of replacing it. If that command already sets multiplexing controls (`ControlMaster`,
-`ControlPath`, `ControlPersist`, `-S`, `-M`, or `-MM`), `git-mux` refuses to run with muxing enabled;
-remove those options or pass `--no-mux`. If `GIT_SSH_COMMAND` is not set, repo-local
-`core.sshCommand` and then an existing `GIT_SSH` wrapper are preserved.
+on exit.
+
+If you already set `GIT_SSH_COMMAND` (or a repo sets `core.sshCommand`), `git-mux` layers its OpenSSH
+options on top of your command instead of replacing it. If that command **already does its own
+multiplexing** (`ControlMaster`, `ControlPath`, `ControlPersist`, `-S`, `-M`, or `-MM`), git-mux
+doesn't double up — it steps aside and runs that repo with its command as-is (printing a note), and
+multiplexes the rest as usual. This is decided per repo, so one custom repo no longer aborts the whole
+batch; pass `--no-mux` to disable git-mux's multiplexing everywhere. If `GIT_SSH_COMMAND` is not set,
+repo-local `core.sshCommand` and then an existing `GIT_SSH` wrapper are preserved.
+
+For unattended runs, git-mux sets `GIT_TERMINAL_PROMPT=0` so a missing credential or host key fails
+fast instead of hanging on a prompt (opt back in with `GIT_TERMINAL_PROMPT=1`), and when there's no
+ssh config at all it defaults to `ssh -o BatchMode=yes`.
 
 ## Requirements
 

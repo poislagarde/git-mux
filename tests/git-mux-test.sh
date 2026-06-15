@@ -178,70 +178,39 @@ test_controlpath_separates_ssh_alias_identities() {
   assert_contains "$personal_path" "gh-personal"
 }
 
-test_rejects_conflicting_git_ssh_command_mux_controls() {
-  local base repo out rc
-  base="$root/ssh-command-conflict"
+test_self_mux_git_ssh_command_used_as_is() {
+  local base repo out variant
+  base="$root/ssh-command-selfmux"
   repo="$base/repo"
   make_repo "$repo"
   git -C "$repo" remote add origin "git@example.com:repo.git"
 
-  set +e
-  out="$(capture env GIT_SSH_COMMAND="ssh -o ControlMaster=no" "$script" -C "$base" -n status -sb)"
-  rc=$?
-  set -e
-  [ "$rc" -eq 2 ] || fail "expected conflicting GIT_SSH_COMMAND to fail with usage error, got exit $rc"
-  assert_contains "$out" "GIT_SSH_COMMAND sets SSH multiplexing controls"
-  assert_contains "$out" "--no-mux"
+  # Every self-multiplexing variant is non-fatal: git-mux uses it as-is and says so.
+  for variant in \
+    "ssh -o ControlMaster=no" \
+    "ssh -S $root/control-socket" \
+    "ssh \"-S\" $root/control-socket" \
+    "ssh -M" \
+    "ssh '-M'" \
+    "ssh -MM" \
+    "ssh \"-o\" ControlPath=$root/control-socket"
+  do
+    out="$(capture env GIT_SSH_COMMAND="$variant" "$script" -C "$base" -n status -sb)" ||
+      fail "expected self-multiplexing GIT_SSH_COMMAND to be used as-is (variant: $variant), got failure: $out"
+    assert_contains "$out" "GIT_SSH_COMMAND already sets SSH multiplexing"
+    assert_contains "$out" "multiplexing: on (via your GIT_SSH_COMMAND)"
+  done
 
+  # --no-mux still turns multiplexing off entirely
   out="$(capture env GIT_SSH_COMMAND="ssh -o ControlMaster=no" "$script" --no-mux -C "$base" -n status -sb)" ||
-    fail "--no-mux should bypass mux conflict checks"
+    fail "--no-mux dry-run failed"
   assert_contains "$out" "multiplexing: off"
 
-  set +e
-  out="$(capture env GIT_SSH_COMMAND="ssh -S $root/control-socket" "$script" -C "$base" -n status -sb)"
-  rc=$?
-  set -e
-  [ "$rc" -eq 2 ] || fail "expected -S in GIT_SSH_COMMAND to fail with usage error, got exit $rc"
-  assert_contains "$out" "GIT_SSH_COMMAND sets SSH multiplexing controls"
-
-  set +e
-  out="$(capture env GIT_SSH_COMMAND="ssh \"-S\" $root/control-socket" "$script" -C "$base" -n status -sb)"
-  rc=$?
-  set -e
-  [ "$rc" -eq 2 ] || fail "expected quoted -S in GIT_SSH_COMMAND to fail with usage error, got exit $rc"
-  assert_contains "$out" "GIT_SSH_COMMAND sets SSH multiplexing controls"
-
-  set +e
-  out="$(capture env GIT_SSH_COMMAND="ssh -M" "$script" -C "$base" -n status -sb)"
-  rc=$?
-  set -e
-  [ "$rc" -eq 2 ] || fail "expected -M in GIT_SSH_COMMAND to fail with usage error, got exit $rc"
-  assert_contains "$out" "GIT_SSH_COMMAND sets SSH multiplexing controls"
-
-  set +e
-  out="$(capture env GIT_SSH_COMMAND="ssh '-M'" "$script" -C "$base" -n status -sb)"
-  rc=$?
-  set -e
-  [ "$rc" -eq 2 ] || fail "expected quoted -M in GIT_SSH_COMMAND to fail with usage error, got exit $rc"
-  assert_contains "$out" "GIT_SSH_COMMAND sets SSH multiplexing controls"
-
-  set +e
-  out="$(capture env GIT_SSH_COMMAND="ssh -MM" "$script" -C "$base" -n status -sb)"
-  rc=$?
-  set -e
-  [ "$rc" -eq 2 ] || fail "expected -MM in GIT_SSH_COMMAND to fail with usage error, got exit $rc"
-  assert_contains "$out" "GIT_SSH_COMMAND sets SSH multiplexing controls"
-
-  set +e
-  out="$(capture env GIT_SSH_COMMAND="ssh \"-o\" ControlPath=$root/control-socket" "$script" -C "$base" -n status -sb)"
-  rc=$?
-  set -e
-  [ "$rc" -eq 2 ] || fail "expected quoted -o ControlPath in GIT_SSH_COMMAND to fail with usage error, got exit $rc"
-  assert_contains "$out" "GIT_SSH_COMMAND sets SSH multiplexing controls"
-
+  # a lowercase -s is NOT a multiplexing control: git-mux multiplexes normally
   out="$(capture env GIT_SSH_COMMAND="ssh -s" "$script" -C "$base" -n status -sb)" ||
     fail "lowercase -s should not be treated as an SSH mux control"
   assert_contains "$out" "multiplexing: on"
+  assert_not_contains "$out" "already sets SSH multiplexing"
 }
 
 test_cleanup_uses_configured_git_ssh_command() {
@@ -317,21 +286,73 @@ test_mux_uses_core_ssh_command_when_env_unset() {
   assert_contains "$logged" "git@127.0.0.1"
 }
 
-test_rejects_conflicting_core_ssh_command_mux_controls() {
-  local base repo out rc
-  base="$root/core-ssh-command-conflict"
+test_self_mux_core_ssh_command_used_as_is() {
+  local base repo out
+  base="$root/core-ssh-command-selfmux"
   repo="$base/repo"
   make_repo "$repo"
   git -C "$repo" remote add origin "git@example.com:repo.git"
   git -C "$repo" config core.sshCommand "ssh '-S' $root/control-socket"
 
-  set +e
-  out="$(capture env -u GIT_SSH_COMMAND -u GIT_SSH "$script" -C "$base" -n status -sb)"
-  rc=$?
-  set -e
-  [ "$rc" -eq 2 ] || fail "expected conflicting core.sshCommand to fail with usage error, got exit $rc"
-  assert_contains "$out" "core.sshCommand in $repo sets SSH multiplexing controls"
-  assert_contains "$out" "--no-mux"
+  # Non-fatal: the repo's own multiplexing is respected and the batch continues.
+  out="$(capture env -u GIT_SSH_COMMAND -u GIT_SSH "$script" -C "$base" -n status -sb)" ||
+    fail "expected core.sshCommand self-multiplexing to be used as-is, got failure: $out"
+  assert_contains "$out" "set SSH multiplexing via their own core.sshCommand"
+  assert_contains "$out" "  - $repo"
+  assert_contains "$out" "multiplexing: on"
+}
+
+test_self_mux_repo_runs_with_its_own_ssh_command() {
+  local base repo out
+  base="$root/core-ssh-command-selfmux-run"
+  repo="$base/repo"
+  make_repo "$repo"
+  git -C "$repo" remote add origin "git@example.com:repo.git"
+  git -C "$repo" config core.sshCommand "ssh -o ControlPath=$root/my-own-socket -o ControlMaster=auto"
+  git -C "$repo" config alias.print-ssh '!printf "GIT_SSH_COMMAND=%s\nGIT_MUX_BASE_SSH_COMMAND=%s\n" "$GIT_SSH_COMMAND" "${GIT_MUX_BASE_SSH_COMMAND:-unset}"'
+
+  out="$(capture env -u GIT_SSH_COMMAND -u GIT_SSH "$script" -C "$base" print-ssh)" ||
+    fail "print-ssh run failed: $out"
+  # the repo's own ssh command is used verbatim...
+  assert_contains "$out" "GIT_SSH_COMMAND=ssh -o ControlPath=$root/my-own-socket -o ControlMaster=auto"
+  # ...and git-mux's mux wrapper is NOT layered on top of it
+  assert_contains "$out" "GIT_MUX_BASE_SSH_COMMAND=unset"
+}
+
+test_disables_interactive_git_prompts() {
+  local base repo out
+  base="$root/no-prompt"
+  repo="$base/repo"
+  make_repo "$repo"
+  git -C "$repo" config alias.print-prompt '!printf "GIT_TERMINAL_PROMPT=%s\n" "${GIT_TERMINAL_PROMPT:-unset}"'
+
+  out="$(capture "$script" -C "$base" print-prompt)" || fail "print-prompt run failed: $out"
+  assert_contains "$out" "GIT_TERMINAL_PROMPT=0"
+}
+
+test_respects_explicit_git_terminal_prompt() {
+  local base repo out
+  base="$root/keep-prompt"
+  repo="$base/repo"
+  make_repo "$repo"
+  git -C "$repo" config alias.print-prompt '!printf "GIT_TERMINAL_PROMPT=%s\n" "${GIT_TERMINAL_PROMPT:-unset}"'
+
+  out="$(capture env GIT_TERMINAL_PROMPT=1 "$script" -C "$base" print-prompt)" ||
+    fail "print-prompt run failed: $out"
+  assert_contains "$out" "GIT_TERMINAL_PROMPT=1"
+}
+
+test_no_config_ssh_defaults_to_batchmode() {
+  local base repo out
+  base="$root/batchmode-default"
+  repo="$base/repo"
+  make_repo "$repo"
+  # no ssh remote -> mux off -> plain path; no core.sshCommand / GIT_SSH(_COMMAND)
+  git -C "$repo" config alias.print-ssh '!printf "GIT_SSH_COMMAND=%s\n" "${GIT_SSH_COMMAND:-unset}"'
+
+  out="$(capture env -u GIT_SSH_COMMAND -u GIT_SSH "$script" -C "$base" print-ssh)" ||
+    fail "print-ssh run failed: $out"
+  assert_contains "$out" "GIT_SSH_COMMAND=ssh -o BatchMode=yes"
 }
 
 test_git_ssh_command_env_assignments_work_with_mux() {
@@ -528,11 +549,15 @@ test_discovers_repos_under_symlinked_directories_once
 test_treats_colon_after_slash_as_local_remote
 test_preserves_and_quotes_git_ssh_command
 test_controlpath_separates_ssh_alias_identities
-test_rejects_conflicting_git_ssh_command_mux_controls
+test_self_mux_git_ssh_command_used_as_is
 test_cleanup_uses_configured_git_ssh_command
 test_mux_uses_git_ssh_when_command_unset
 test_mux_uses_core_ssh_command_when_env_unset
-test_rejects_conflicting_core_ssh_command_mux_controls
+test_self_mux_core_ssh_command_used_as_is
+test_self_mux_repo_runs_with_its_own_ssh_command
+test_disables_interactive_git_prompts
+test_respects_explicit_git_terminal_prompt
+test_no_config_ssh_defaults_to_batchmode
 test_git_ssh_command_env_assignments_work_with_mux
 test_controlpath_uses_bounded_alias_hash
 test_does_not_retry_permanent_unable_to_access
