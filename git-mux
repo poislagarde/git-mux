@@ -298,8 +298,13 @@ EOF
   chmod 700 "$wrapper"
 }
 
-# unique SSH endpoints (for clean teardown) + unique hosts (for the header)
-endpoint_targets=(); endpoint_ports=(); endpoint_base_commands=(); hosts=(); repo_has_ssh=()
+# git-mux-MANAGED SSH endpoints (the ones it opens and tears down its own master
+# for) + every SSH host (for the header). Endpoints belonging to a repo that
+# multiplexes itself are deliberately NOT tracked here: git-mux must not append
+# its own ControlMaster/ControlPath to that repo's command, nor send `-O exit` to
+# the user's own control socket during cleanup.
+endpoint_targets=(); endpoint_ports=(); endpoint_base_commands=(); hosts=()
+selfmux_repos=()
 add_uniq() {  # $1=arrayname-by-ref via eval, $2=value
   local arr="$1" val="$2"
   [ -n "$val" ] || return 0
@@ -318,9 +323,18 @@ add_endpoint() {
   endpoint_ports+=("$pt")
   endpoint_base_commands+=("$base_cmd")
 }
+# Does the environment's GIT_SSH_COMMAND already multiplex? That applies to every
+# repo, so git-mux skips managing connections entirely. Computed up front so the
+# endpoint scan can decide what to track.
+GLOBAL_SELF_MUX=0
+if [ "$MUX" = 1 ] && [ -n "$USER_GIT_SSH_COMMAND" ] && ssh_command_has_mux_controls "$USER_GIT_SSH_COMMAND"; then
+  GLOBAL_SELF_MUX=1
+fi
 for r in "${repos[@]}"; do
   has_ssh=0
   repo_base_ssh_command="$(base_ssh_command "$r")"
+  repo_self_mux=0
+  ssh_command_has_mux_controls "$repo_base_ssh_command" && repo_self_mux=1
   while IFS= read -r url; do
     [ -n "$url" ] || continue
     ep_out="$(ssh_endpoint "$url")"
@@ -328,45 +342,41 @@ for r in "${repos[@]}"; do
     pt="$(printf '%s\n' "$ep_out" | sed -n '2p')"
     if [ -n "$ep" ]; then
       has_ssh=1
-      add_endpoint "$ep" "$pt" "$repo_base_ssh_command"
       add_uniq hosts "${ep#*@}"
+      # Only track endpoints git-mux will actually manage. A repo that multiplexes
+      # itself (or a global GIT_SSH_COMMAND that does) owns its own sockets.
+      if [ "$MUX" = 1 ] && [ "$repo_self_mux" = 0 ] && [ "$GLOBAL_SELF_MUX" = 0 ]; then
+        add_endpoint "$ep" "$pt" "$repo_base_ssh_command"
+      fi
     fi
   done < <(git -C "$r" remote -v 2>/dev/null | awk '{print $2}' | sort -u)
-  repo_has_ssh+=("$has_ssh")
+  if [ "$has_ssh" = 1 ] && [ "$repo_self_mux" = 1 ] && [ "$GLOBAL_SELF_MUX" = 0 ]; then
+    selfmux_repos+=("${r#./}")
+  fi
 done
 
 # ---- plan / dry-run -------------------------------------------------------
 hoststr="$(printf '%s, ' "${hosts[@]}")"; hoststr="${hoststr%, }"
 [ -n "$hoststr" ] || hoststr="(no SSH remotes)"
-# A repo (or your environment) may already do its own SSH multiplexing via
-# core.sshCommand or GIT_SSH_COMMAND. git-mux can't safely layer its own
-# ControlMaster/ControlPath on top of an existing one, so for those it steps
-# aside and uses their ssh command as-is. This is per-repo and non-fatal — one
-# custom repo no longer aborts the whole batch (just pass --no-mux to opt out
-# globally). Self-multiplexing repos still share their own connection.
-GLOBAL_SELF_MUX=0
+# Multiplexing status + a note for any repo git-mux is stepping aside for. A repo
+# that already multiplexes via core.sshCommand (or a global GIT_SSH_COMMAND that
+# does) was detected during the endpoint scan above and runs with its own ssh
+# command as-is — git-mux just doesn't manage it. This is per-repo and non-fatal:
+# one custom repo no longer aborts the whole batch (pass --no-mux to disable
+# git-mux's multiplexing everywhere).
 muxstr="off"
-selfmux_repos=()
-if [ "$MUX" = 1 ] && [ "${#endpoint_targets[@]}" -gt 0 ]; then
-  muxstr="on"
-  if [ -n "$USER_GIT_SSH_COMMAND" ] && ssh_command_has_mux_controls "$USER_GIT_SSH_COMMAND"; then
-    GLOBAL_SELF_MUX=1
+if [ "$MUX" = 1 ] && [ "${#hosts[@]}" -gt 0 ]; then
+  if [ "$GLOBAL_SELF_MUX" = 1 ]; then
     muxstr="on (via your GIT_SSH_COMMAND)"
+    echo "$prog: GIT_SSH_COMMAND already sets SSH multiplexing; using it as-is, git-mux's own multiplexing is skipped" >&2
+    echo "$prog: (if it disables multiplexing, e.g. ControlMaster=no, you may hit the server's connection-rate throttle)" >&2
   else
-    for idx in "${!repos[@]}"; do
-      [ "${repo_has_ssh[$idx]}" = 1 ] || continue
-      if ssh_command_has_mux_controls "$(base_ssh_command "${repos[$idx]}")"; then
-        selfmux_repos+=("${repos[$idx]#./}")
-      fi
-    done
+    muxstr="on"
+    if [ "${#selfmux_repos[@]}" -gt 0 ]; then
+      echo "$prog: ${#selfmux_repos[@]} repo(s) set SSH multiplexing via their own core.sshCommand; using each as-is, git-mux's own multiplexing skipped for them:" >&2
+      for selfmux_name in "${selfmux_repos[@]}"; do echo "  - $selfmux_name" >&2; done
+    fi
   fi
-fi
-if [ "$GLOBAL_SELF_MUX" = 1 ]; then
-  echo "$prog: GIT_SSH_COMMAND already sets SSH multiplexing; using it as-is, git-mux's own multiplexing is skipped" >&2
-  echo "$prog: (if it disables multiplexing, e.g. ControlMaster=no, you may hit the server's connection-rate throttle)" >&2
-elif [ "${#selfmux_repos[@]}" -gt 0 ]; then
-  echo "$prog: ${#selfmux_repos[@]} repo(s) set SSH multiplexing via their own core.sshCommand; using each as-is, git-mux's own multiplexing skipped for them:" >&2
-  for selfmux_name in "${selfmux_repos[@]}"; do echo "  - $selfmux_name" >&2; done
 fi
 if [ "$QUIET" = 0 ] || [ "$DRY" = 1 ]; then
   echo "${C_DIM}$prog: git ${GIT_ARGS[*]}${C_RST}"
@@ -379,7 +389,10 @@ fi
 
 # ---- set up SSH connection multiplexing -----------------------------------
 SOCKDIR=""; GIT_MUX_EFFECTIVE_SSH_COMMAND=""; SSH_MUX_WRAPPER=""
-if [ "$MUX" = 1 ] && [ "${#endpoint_targets[@]}" -gt 0 ] && [ "$GLOBAL_SELF_MUX" = 0 ]; then
+# endpoint_targets holds only git-mux-managed endpoints (self-mux repos and the
+# global-GIT_SSH_COMMAND case were already filtered out during the scan), so a
+# non-empty list is exactly when git-mux needs its own wrapper.
+if [ "$MUX" = 1 ] && [ "${#endpoint_targets[@]}" -gt 0 ]; then
   # Control sockets need a SHORT base path: an AF_UNIX socket path is capped at
   # ~104 chars and ssh's %C token is 40, so a long $TMPDIR (e.g. macOS's
   # /var/folders/...) won't fit. Default to /tmp; override with GIT_MUX_SOCKDIR.

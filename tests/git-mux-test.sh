@@ -355,6 +355,51 @@ test_no_config_ssh_defaults_to_batchmode() {
   assert_contains "$out" "GIT_SSH_COMMAND=ssh -o BatchMode=yes"
 }
 
+test_cleanup_skips_self_mux_repos() {
+  local base managed selfmux fakem fakes logm logs sockbase out rc managed_log selfmux_log
+  base="$root/cleanup-skips-selfmux"
+  managed="$base/managed"
+  selfmux="$base/selfmux"
+  fakem="$root/fake-managed-ssh"
+  fakes="$root/fake-selfmux-ssh"
+  logm="$root/managed-ssh.log"
+  logs="$root/selfmux-ssh.log"
+  sockbase="$root/cleanup-skip-socks"
+  make_repo "$managed"
+  make_repo "$selfmux"
+  mkdir -p "$sockbase"
+  git -C "$managed" remote add origin "git@127.0.0.1:repo.git"
+  git -C "$selfmux" remote add origin "git@127.0.0.2:repo.git"
+  # managed: a plain ssh command (no mux controls) -> git-mux opens/closes its master
+  git -C "$managed" config core.sshCommand "GIT_MUX_FAKE_MARKER=managed '$fakem'"
+  # selfmux: its own multiplexing controls -> git-mux must leave its socket alone
+  git -C "$selfmux" config core.sshCommand "GIT_MUX_FAKE_MARKER=selfmux '$fakes' -o ControlMaster=auto -o ControlPath=$root/selfmux-own-socket"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s %s\n" "${GIT_MUX_FAKE_MARKER:-missing}" "$*" >> "$GIT_MUX_SSH_LOG_M"; exit 1' > "$fakem"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s %s\n" "${GIT_MUX_FAKE_MARKER:-missing}" "$*" >> "$GIT_MUX_SSH_LOG_S"; exit 1' > "$fakes"
+  chmod +x "$fakem" "$fakes"
+
+  set +e
+  out="$(capture env -u GIT_SSH_COMMAND -u GIT_SSH GIT_MUX_SOCKDIR="$sockbase" \
+    GIT_MUX_SSH_LOG_M="$logm" GIT_MUX_SSH_LOG_S="$logs" \
+    "$script" -C "$base" -r 0 ls-remote origin)"
+  rc=$?
+  set -e
+  [ "$rc" -eq 2 ] || fail "expected both fake repos to fail, got exit $rc: $out"
+
+  # the managed repo's master IS torn down through git-mux's wrapper
+  [ -f "$logm" ] || fail "expected managed repo's ssh command to be invoked"
+  managed_log="$(cat "$logm")"
+  assert_contains "$managed_log" "managed"
+  assert_contains "$managed_log" "-O exit"
+
+  # the self-mux repo ran with its own command, but cleanup NEVER touched its socket
+  [ -f "$logs" ] || fail "expected self-mux repo's ssh command to be invoked during the run"
+  selfmux_log="$(cat "$logs")"
+  assert_contains "$selfmux_log" "selfmux"
+  assert_not_contains "$selfmux_log" "-O exit"
+  assert_not_contains "$selfmux_log" "$sockbase"
+}
+
 test_git_ssh_command_env_assignments_work_with_mux() {
   local base repo fake log logged out rc
   base="$root/ssh-command-env-assignment"
@@ -558,6 +603,7 @@ test_self_mux_repo_runs_with_its_own_ssh_command
 test_disables_interactive_git_prompts
 test_respects_explicit_git_terminal_prompt
 test_no_config_ssh_defaults_to_batchmode
+test_cleanup_skips_self_mux_repos
 test_git_ssh_command_env_assignments_work_with_mux
 test_controlpath_uses_bounded_alias_hash
 test_does_not_retry_permanent_unable_to_access
