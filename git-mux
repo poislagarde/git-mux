@@ -422,6 +422,9 @@ fi
 cleanup() {
   local idx ep pt base_cmd
   if [ -n "$SOCKDIR" ]; then
+    # endpoint_targets contains only git-mux-managed endpoints (the scan excludes
+    # self-mux repos and the global-GIT_SSH_COMMAND case), so every `-O exit` here
+    # closes a master git-mux opened — never a user's own self-managed connection.
     for idx in "${!endpoint_targets[@]}"; do
       ep="${endpoint_targets[$idx]}"
       pt="${endpoint_ports[$idx]}"
