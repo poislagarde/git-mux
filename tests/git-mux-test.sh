@@ -319,6 +319,21 @@ test_self_mux_repo_runs_with_its_own_ssh_command() {
   assert_contains "$out" "GIT_MUX_BASE_SSH_COMMAND=unset"
 }
 
+test_self_mux_command_gets_batchmode() {
+  local base repo out
+  base="$root/selfmux-batchmode"
+  repo="$base/repo"
+  make_repo "$repo"
+  git -C "$repo" remote add origin "git@example.com:repo.git"
+  git -C "$repo" config core.sshCommand "ssh -o ControlMaster=auto -o ControlPath=$root/own-socket"
+  git -C "$repo" config alias.print-ssh '!printf "GIT_SSH_COMMAND=%s\n" "$GIT_SSH_COMMAND"'
+
+  # self-mux bypasses the wrapper, so git-mux appends BatchMode=yes itself
+  out="$(capture env -u GIT_SSH_COMMAND -u GIT_SSH "$script" -C "$base" print-ssh)" ||
+    fail "print-ssh run failed: $out"
+  assert_contains "$out" "GIT_SSH_COMMAND=ssh -o ControlMaster=auto -o ControlPath=$root/own-socket -o BatchMode=yes"
+}
+
 test_disables_interactive_git_prompts() {
   local base repo out
   base="$root/no-prompt"
@@ -600,6 +615,7 @@ test_mux_uses_git_ssh_when_command_unset
 test_mux_uses_core_ssh_command_when_env_unset
 test_self_mux_core_ssh_command_used_as_is
 test_self_mux_repo_runs_with_its_own_ssh_command
+test_self_mux_command_gets_batchmode
 test_disables_interactive_git_prompts
 test_respects_explicit_git_terminal_prompt
 test_no_config_ssh_defaults_to_batchmode

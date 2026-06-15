@@ -119,14 +119,23 @@ on exit.
 If you already set `GIT_SSH_COMMAND` (or a repo sets `core.sshCommand`), `git-mux` layers its OpenSSH
 options on top of your command instead of replacing it. If that command **already does its own
 multiplexing** (`ControlMaster`, `ControlPath`, `ControlPersist`, `-S`, `-M`, or `-MM`), git-mux
-doesn't double up — it steps aside and runs that repo with its command as-is (printing a note), and
-multiplexes the rest as usual. This is decided per repo, so one custom repo no longer aborts the whole
-batch; pass `--no-mux` to disable git-mux's multiplexing everywhere. If `GIT_SSH_COMMAND` is not set,
+doesn't double up — it runs that command as-is (and appends `-o BatchMode=yes`; see below). How widely
+it steps aside depends on where the command comes from:
+
+- A repo-local **`core.sshCommand`** is handled **per repo**: git-mux skips its own multiplexing for
+  just that repo and keeps multiplexing the rest, so one custom repo no longer aborts the whole batch.
+- A self-multiplexing **`GIT_SSH_COMMAND`** in your environment applies to **every** repo, so git-mux
+  disables its own wrapper for the entire run and relies on your command throughout (a fixed
+  `ControlPath` already shares one socket across repos).
+
+Pass `--no-mux` to disable git-mux's multiplexing everywhere. If `GIT_SSH_COMMAND` is not set,
 repo-local `core.sshCommand` and then an existing `GIT_SSH` wrapper are preserved.
 
-For unattended runs, git-mux sets `GIT_TERMINAL_PROMPT=0` so a missing credential or host key fails
-fast instead of hanging on a prompt (opt back in with `GIT_TERMINAL_PROMPT=1`), and when there's no
-ssh config at all it defaults to `ssh -o BatchMode=yes`.
+For unattended runs, git-mux avoids blocking on a prompt. It sets `GIT_TERMINAL_PROMPT=0` — but that
+only covers **Git's own** credential prompts, not SSH's — so it also forces SSH `BatchMode=yes`: the
+mux wrapper sets it for managed repos, a self-multiplexing command has it appended, and the
+no-ssh-config fallback defaults to `ssh -o BatchMode=yes`. (Opt back into Git prompts with
+`GIT_TERMINAL_PROMPT=1`.)
 
 ## Requirements
 
