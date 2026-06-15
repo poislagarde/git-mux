@@ -98,6 +98,13 @@ if [ ! -d "$BASE" ]; then echo "$prog: not a directory: $BASE" >&2; exit 2; fi
 USER_GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-}"
 USER_GIT_SSH="${GIT_SSH:-}"
 
+# Unattended batch: never block on an interactive prompt. Turn a would-be hang
+# (HTTPS credential helper, SSH key passphrase, host-key confirmation) into a
+# fast, reported failure instead. SSH BatchMode is enforced separately — the mux
+# wrapper sets it, and the no-config ssh fallback in base_ssh_command adds it too.
+# Opt back into prompts with GIT_TERMINAL_PROMPT=1.
+export GIT_TERMINAL_PROMPT="${GIT_TERMINAL_PROMPT:-0}"
+
 # colors only on a tty
 if [ -t 1 ]; then
   C_OK=$'\033[32m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
@@ -214,19 +221,9 @@ base_ssh_command() {
   elif [ -n "$USER_GIT_SSH" ]; then
     quote_args "$USER_GIT_SSH"
   else
-    printf '%s\n' ssh
-  fi
-}
-base_ssh_command_source() {
-  local repo="${1:-}" core_cmd
-  if [ -n "$USER_GIT_SSH_COMMAND" ]; then
-    printf '%s\n' "GIT_SSH_COMMAND"
-  elif [ -n "$repo" ] && core_cmd="$(repo_core_ssh_command "$repo")" && [ -n "$core_cmd" ]; then
-    printf '%s\n' "core.sshCommand in $repo"
-  elif [ -n "$USER_GIT_SSH" ]; then
-    printf '%s\n' "GIT_SSH"
-  else
-    printf '%s\n' "ssh"
+    # No user/repo ssh config: default to BatchMode so an unattended run fails
+    # fast instead of blocking on a passphrase or host-key prompt.
+    printf '%s\n' 'ssh -o BatchMode=yes'
   fi
 }
 
@@ -301,8 +298,13 @@ EOF
   chmod 700 "$wrapper"
 }
 
-# unique SSH endpoints (for clean teardown) + unique hosts (for the header)
-endpoint_targets=(); endpoint_ports=(); endpoint_base_commands=(); hosts=(); repo_has_ssh=()
+# git-mux-MANAGED SSH endpoints (the ones it opens and tears down its own master
+# for) + every SSH host (for the header). Endpoints belonging to a repo that
+# multiplexes itself are deliberately NOT tracked here: git-mux must not append
+# its own ControlMaster/ControlPath to that repo's command, nor send `-O exit` to
+# the user's own control socket during cleanup.
+endpoint_targets=(); endpoint_ports=(); endpoint_base_commands=(); hosts=()
+selfmux_repos=()
 add_uniq() {  # $1=arrayname-by-ref via eval, $2=value
   local arr="$1" val="$2"
   [ -n "$val" ] || return 0
@@ -321,9 +323,18 @@ add_endpoint() {
   endpoint_ports+=("$pt")
   endpoint_base_commands+=("$base_cmd")
 }
+# Does the environment's GIT_SSH_COMMAND already multiplex? That applies to every
+# repo, so git-mux skips managing connections entirely. Computed up front so the
+# endpoint scan can decide what to track.
+GLOBAL_SELF_MUX=0
+if [ "$MUX" = 1 ] && [ -n "$USER_GIT_SSH_COMMAND" ] && ssh_command_has_mux_controls "$USER_GIT_SSH_COMMAND"; then
+  GLOBAL_SELF_MUX=1
+fi
 for r in "${repos[@]}"; do
   has_ssh=0
   repo_base_ssh_command="$(base_ssh_command "$r")"
+  repo_self_mux=0
+  ssh_command_has_mux_controls "$repo_base_ssh_command" && repo_self_mux=1
   while IFS= read -r url; do
     [ -n "$url" ] || continue
     ep_out="$(ssh_endpoint "$url")"
@@ -331,29 +342,41 @@ for r in "${repos[@]}"; do
     pt="$(printf '%s\n' "$ep_out" | sed -n '2p')"
     if [ -n "$ep" ]; then
       has_ssh=1
-      add_endpoint "$ep" "$pt" "$repo_base_ssh_command"
       add_uniq hosts "${ep#*@}"
+      # Only track endpoints git-mux will actually manage. A repo that multiplexes
+      # itself (or a global GIT_SSH_COMMAND that does) owns its own sockets.
+      if [ "$MUX" = 1 ] && [ "$repo_self_mux" = 0 ] && [ "$GLOBAL_SELF_MUX" = 0 ]; then
+        add_endpoint "$ep" "$pt" "$repo_base_ssh_command"
+      fi
     fi
   done < <(git -C "$r" remote -v 2>/dev/null | awk '{print $2}' | sort -u)
-  repo_has_ssh+=("$has_ssh")
+  if [ "$has_ssh" = 1 ] && [ "$repo_self_mux" = 1 ] && [ "$GLOBAL_SELF_MUX" = 0 ]; then
+    selfmux_repos+=("${r#./}")
+  fi
 done
 
 # ---- plan / dry-run -------------------------------------------------------
 hoststr="$(printf '%s, ' "${hosts[@]}")"; hoststr="${hoststr%, }"
 [ -n "$hoststr" ] || hoststr="(no SSH remotes)"
+# Multiplexing status + a note for any repo git-mux is stepping aside for. A repo
+# that already multiplexes via core.sshCommand (or a global GIT_SSH_COMMAND that
+# does) was detected during the endpoint scan above and runs with its own ssh
+# command as-is — git-mux just doesn't manage it. This is per-repo and non-fatal:
+# one custom repo no longer aborts the whole batch (pass --no-mux to disable
+# git-mux's multiplexing everywhere).
 muxstr="off"
-if [ "$MUX" = 1 ] && [ "${#endpoint_targets[@]}" -gt 0 ]; then
-  muxstr="on"
-  for idx in "${!repos[@]}"; do
-    [ "${repo_has_ssh[$idx]}" = 1 ] || continue
-    repo_base_ssh_command="$(base_ssh_command "${repos[$idx]}")"
-    if ssh_command_has_mux_controls "$repo_base_ssh_command"; then
-      ssh_command_source="$(base_ssh_command_source "${repos[$idx]}")"
-      echo "$prog: $ssh_command_source sets SSH multiplexing controls that conflict with git-mux" >&2
-      echo "$prog: remove ControlMaster/ControlPath/ControlPersist/-S/-M/-MM from $ssh_command_source or pass --no-mux" >&2
-      exit 2
+if [ "$MUX" = 1 ] && [ "${#hosts[@]}" -gt 0 ]; then
+  if [ "$GLOBAL_SELF_MUX" = 1 ]; then
+    muxstr="on (via your GIT_SSH_COMMAND)"
+    echo "$prog: GIT_SSH_COMMAND already sets SSH multiplexing; using it as-is, git-mux's own multiplexing is skipped" >&2
+    echo "$prog: (if it disables multiplexing, e.g. ControlMaster=no, you may hit the server's connection-rate throttle)" >&2
+  else
+    muxstr="on"
+    if [ "${#selfmux_repos[@]}" -gt 0 ]; then
+      echo "$prog: ${#selfmux_repos[@]} repo(s) set SSH multiplexing via their own core.sshCommand; using each as-is, git-mux's own multiplexing skipped for them:" >&2
+      for selfmux_name in "${selfmux_repos[@]}"; do echo "  - $selfmux_name" >&2; done
     fi
-  done
+  fi
 fi
 if [ "$QUIET" = 0 ] || [ "$DRY" = 1 ]; then
   echo "${C_DIM}$prog: git ${GIT_ARGS[*]}${C_RST}"
@@ -366,6 +389,9 @@ fi
 
 # ---- set up SSH connection multiplexing -----------------------------------
 SOCKDIR=""; GIT_MUX_EFFECTIVE_SSH_COMMAND=""; SSH_MUX_WRAPPER=""
+# endpoint_targets holds only git-mux-managed endpoints (self-mux repos and the
+# global-GIT_SSH_COMMAND case were already filtered out during the scan), so a
+# non-empty list is exactly when git-mux needs its own wrapper.
 if [ "$MUX" = 1 ] && [ "${#endpoint_targets[@]}" -gt 0 ]; then
   # Control sockets need a SHORT base path: an AF_UNIX socket path is capped at
   # ~104 chars and ssh's %C token is 40, so a long $TMPDIR (e.g. macOS's
@@ -396,6 +422,9 @@ fi
 cleanup() {
   local idx ep pt base_cmd
   if [ -n "$SOCKDIR" ]; then
+    # endpoint_targets contains only git-mux-managed endpoints (the scan excludes
+    # self-mux repos and the global-GIT_SSH_COMMAND case), so every `-O exit` here
+    # closes a master git-mux opened — never a user's own self-managed connection.
     for idx in "${!endpoint_targets[@]}"; do
       ep="${endpoint_targets[$idx]}"
       pt="${endpoint_ports[$idx]}"
@@ -437,12 +466,23 @@ i=0; total=${#repos[@]}
 for r in "${repos[@]}"; do
   i=$((i + 1)); name="${r#./}"
   repo_base_ssh_command="$(base_ssh_command "$r")"
+  repo_self_mux=0
+  ssh_command_has_mux_controls "$repo_base_ssh_command" && repo_self_mux=1
+  # A self-mux command runs without git-mux's wrapper, so it misses the wrapper's
+  # BatchMode=yes (and GIT_TERMINAL_PROMPT only covers Git's own prompts, not
+  # SSH's). Append it so an unattended run fails fast on an SSH passphrase /
+  # host-key / password prompt instead of hanging. ssh uses the first value for
+  # an option, so a BatchMode the user already set in their command still wins.
+  repo_run_ssh_command="$repo_base_ssh_command"
+  [ "$repo_self_mux" = 1 ] && repo_run_ssh_command="$repo_base_ssh_command -o BatchMode=yes"
   attempt=0
   while :; do
-    if [ -n "$GIT_MUX_EFFECTIVE_SSH_COMMAND" ]; then
+    if [ -n "$GIT_MUX_EFFECTIVE_SSH_COMMAND" ] && [ "$repo_self_mux" = 0 ]; then
+      # layer git-mux's shared-connection multiplexing on top of the repo's ssh command
       out="$(GIT_MUX_BASE_SSH_COMMAND="$repo_base_ssh_command" git "${GIT_COLOR[@]}" -C "$r" "${GIT_ARGS[@]}" 2>&1)"; rc=$?
     else
-      out="$(git "${GIT_COLOR[@]}" -C "$r" "${GIT_ARGS[@]}" 2>&1)"; rc=$?
+      # mux off, or the repo multiplexes itself: run with the repo's own ssh command
+      out="$(GIT_SSH_COMMAND="$repo_run_ssh_command" git "${GIT_COLOR[@]}" -C "$r" "${GIT_ARGS[@]}" 2>&1)"; rc=$?
     fi
     if [ "$rc" -eq 0 ]; then
       ok=$((ok + 1))

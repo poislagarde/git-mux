@@ -114,11 +114,28 @@ identities do not reuse one another's master connection and long hostnames do no
 path limits. Repos using the same SSH alias still share one connection. `ServerAlive*` makes a
 silently-throttling server drop the connection instead of hanging, and `BatchMode` keeps it from
 blocking on a prompt. Host-key checking is left to your SSH config. The master connections are closed
-on exit. If you already set `GIT_SSH_COMMAND`, `git-mux` appends its OpenSSH options to your command
-instead of replacing it. If that command already sets multiplexing controls (`ControlMaster`,
-`ControlPath`, `ControlPersist`, `-S`, `-M`, or `-MM`), `git-mux` refuses to run with muxing enabled;
-remove those options or pass `--no-mux`. If `GIT_SSH_COMMAND` is not set, repo-local
-`core.sshCommand` and then an existing `GIT_SSH` wrapper are preserved.
+on exit.
+
+If you already set `GIT_SSH_COMMAND` (or a repo sets `core.sshCommand`), `git-mux` layers its OpenSSH
+options on top of your command instead of replacing it. If that command **already does its own
+multiplexing** (`ControlMaster`, `ControlPath`, `ControlPersist`, `-S`, `-M`, or `-MM`), git-mux
+doesn't double up — it runs that command as-is (and appends `-o BatchMode=yes`; see below). How widely
+it steps aside depends on where the command comes from:
+
+- A repo-local **`core.sshCommand`** is handled **per repo**: git-mux skips its own multiplexing for
+  just that repo and keeps multiplexing the rest, so one custom repo no longer aborts the whole batch.
+- A self-multiplexing **`GIT_SSH_COMMAND`** in your environment applies to **every** repo, so git-mux
+  disables its own wrapper for the entire run and relies on your command throughout (a fixed
+  `ControlPath` already shares one socket across repos).
+
+Pass `--no-mux` to disable git-mux's multiplexing everywhere. If `GIT_SSH_COMMAND` is not set,
+repo-local `core.sshCommand` and then an existing `GIT_SSH` wrapper are preserved.
+
+For unattended runs, git-mux avoids blocking on a prompt. It sets `GIT_TERMINAL_PROMPT=0` — but that
+only covers **Git's own** credential prompts, not SSH's — so it also forces SSH `BatchMode=yes`: the
+mux wrapper sets it for managed repos, a self-multiplexing command has it appended, and the
+no-ssh-config fallback defaults to `ssh -o BatchMode=yes`. (Opt back into Git prompts with
+`GIT_TERMINAL_PROMPT=1`.)
 
 ## Requirements
 
